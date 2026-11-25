@@ -76,8 +76,21 @@ export interface PushChange {
 
 const API_VERSION = "2022-11-28";
 const TIMEOUT_MS = 30_000;
+/** The slowest link a transfer is allowed for: 1 Mbit/s, in bytes per millisecond. */
+const MIN_BYTES_PER_MS = 125;
+/** Blobs larger than this upload one at a time, so each has the whole link its timeout assumes. */
+const LARGE_BLOB_BYTES = 8 * 1024 * 1024;
 const TREE_CHUNK = 300;
 const CONCURRENCY = 8;
+
+/** A request's timeout: the base one, plus time to move `bytes` over the slowest link allowed.
+ *  A fixed 30 s cut off large source files (a 57 MB PDF is ~76 MB as base64), failing every round. */
+export function transferTimeoutMs(bytes: number): number {
+	return TIMEOUT_MS + Math.ceil(Math.max(0, bytes) / MIN_BYTES_PER_MS);
+}
+
+/** How many bytes a blob of `size` takes on the wire as base64. */
+const base64Length = (size: number) => Math.ceil(size / 3) * 4;
 /** Written to an empty repo so it has a first commit the Git Data API can build on. */
 const BOOTSTRAP_PATH = ".learnharness-sync";
 
@@ -120,7 +133,9 @@ export class GitHubRepo {
 		this.repoPath = `/repos/${encodeURIComponent(cfg.owner)}/${encodeURIComponent(cfg.repo)}`;
 	}
 
-	private async request(method: string, urlPath: string, body?: unknown): Promise<unknown> {
+	/** `expectBytes`: the size of the answer when it is known to be large (a blob), so its timeout allows for it. */
+	private async request(method: string, urlPath: string, body?: unknown, expectBytes = 0): Promise<unknown> {
+		const payload = body === undefined ? undefined : JSON.stringify(body);
 		let res: Response;
 		try {
 			res = await this.fetchImpl(`${this.base}${urlPath}`, {
@@ -132,8 +147,9 @@ export class GitHubRepo {
 					"user-agent": this.cfg.userAgent ?? "learnharness-sync",
 					...(body === undefined ? {} : { "content-type": "application/json" }),
 				},
-				body: body === undefined ? undefined : JSON.stringify(body),
-				signal: AbortSignal.timeout(TIMEOUT_MS),
+				body: payload,
+				// The signal also bounds reading the answer's body (res.json() below).
+				signal: AbortSignal.timeout(transferTimeoutMs((payload?.length ?? 0) + expectBytes)),
 			});
 		} catch (err) {
 			throw new GitHubError(`could not reach GitHub: ${err instanceof Error ? err.message : String(err)}`, "network");
@@ -208,19 +224,22 @@ export class GitHubRepo {
 		return out;
 	}
 
-	/** A file's bytes by blob SHA. */
-	async blob(sha: string): Promise<Uint8Array> {
-		const body = (await this.request("GET", `${this.repoPath}/git/blobs/${sha}`)) as { content?: string; encoding?: string };
+	/** A file's bytes by blob SHA. `size` (bytes, from the tree listing) widens the timeout for a large file. */
+	async blob(sha: string, size = 0): Promise<Uint8Array> {
+		const body = (await this.request("GET", `${this.repoPath}/git/blobs/${sha}`, undefined, base64Length(size))) as {
+			content?: string;
+			encoding?: string;
+		};
 		if (body.encoding !== "base64" || typeof body.content !== "string") {
 			throw new GitHubError("GitHub returned a blob in an unexpected encoding", "http");
 		}
 		return new Uint8Array(Buffer.from(body.content, "base64"));
 	}
 
-	/** Several blobs at once (bounded), keyed by SHA. */
-	async blobs(shas: readonly string[]): Promise<Record<string, Uint8Array>> {
+	/** Several blobs at once (bounded), keyed by SHA. `sizes` (SHA → bytes) widens each large one's timeout. */
+	async blobs(shas: readonly string[], sizes: Readonly<Record<string, number>> = {}): Promise<Record<string, Uint8Array>> {
 		const unique = [...new Set(shas)];
-		const bytes = await mapLimit(unique, CONCURRENCY, (sha) => this.blob(sha));
+		const bytes = await mapLimit(unique, CONCURRENCY, (sha) => this.blob(sha, sizes[sha] ?? 0));
 		return Object.fromEntries(unique.map((sha, i) => [sha, bytes[i] as Uint8Array]));
 	}
 
@@ -247,7 +266,7 @@ export class GitHubRepo {
 		const base = parent ?? (await this.bootstrap(branch));
 		if (changes.length === 0) return base;
 
-		const entries = await mapLimit(changes, CONCURRENCY, async (c) => {
+		const toEntry = async (c: PushChange) => {
 			const entry = { path: c.path, mode: "100644", type: "blob" } as const;
 			if (c.content === null) return { ...entry, sha: null };
 			const text = asUtf8(c.content);
@@ -257,7 +276,18 @@ export class GitHubRepo {
 				encoding: "base64",
 			})) as { sha: string };
 			return { ...entry, sha: blob.sha };
-		});
+		};
+		// Small files go CONCURRENCY at a time; large ones one at a time, so a slow link is not split eight ways.
+		const isLarge = (c: PushChange) => c.content !== null && c.content.byteLength > LARGE_BLOB_BYTES;
+		const indexes = changes.map((_, i) => i);
+		const entries: Awaited<ReturnType<typeof toEntry>>[] = new Array(changes.length);
+		for (const [group, limit] of [
+			[indexes.filter((i) => !isLarge(changes[i] as PushChange)), CONCURRENCY],
+			[indexes.filter((i) => isLarge(changes[i] as PushChange)), 1],
+		] as const) {
+			const made = await mapLimit(group, limit, (i) => toEntry(changes[i] as PushChange));
+			group.forEach((i, k) => (entries[i] = made[k] as Awaited<ReturnType<typeof toEntry>>));
+		}
 
 		let tree = base.tree;
 		for (let i = 0; i < entries.length; i += TREE_CHUNK) {

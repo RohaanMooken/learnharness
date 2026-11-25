@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { GitHubError, GitHubRepo } from "../src/server/sync/github.ts";
+import { GitHubError, GitHubRepo, transferTimeoutMs } from "../src/server/sync/github.ts";
 
 interface Call {
 	method: string;
@@ -94,6 +94,15 @@ describe("GitHubRepo requests", () => {
 		const out = await repo.blobs(["s1", "s1"]);
 		assert.equal(Buffer.from(out.s1 as Uint8Array).toString(), "hi");
 		assert.equal(calls.length, 1);
+	});
+});
+
+describe("transferTimeoutMs", () => {
+	it("keeps 30 s for small requests and allows 1 Mbit/s for large ones", () => {
+		assert.equal(transferTimeoutMs(0), 30_000);
+		assert.equal(transferTimeoutMs(1_000), 30_008);
+		// a 57 MB PDF is ~76 MB as base64: about 10 minutes more, not a 30 s cut-off
+		assert.equal(transferTimeoutMs(76_000_000), 30_000 + 608_000);
 	});
 });
 
@@ -217,6 +226,54 @@ describe("GitHubRepo.push", () => {
 		assert.equal(calls[0]?.method, "PUT");
 		assert.equal((calls.find((c) => c.path.endsWith("/git/trees"))?.body as { base_tree: string }).base_tree, "t0");
 		assert.deepEqual((calls.find((c) => c.path.endsWith("/git/commits"))?.body as { parents: string[] }).parents, ["c0"]);
+	});
+
+	it("uploads large files one at a time, small ones together, and keeps the tree in the given order", async () => {
+		const large = (byte: number) => new Uint8Array(9 * 1024 * 1024).fill(byte); // > 8 MB, and binary (0xff is not UTF-8)
+		const small = (byte: number) => new Uint8Array([0x00, byte]);
+		let inFlight = 0;
+		let largeInFlight = 0;
+		let maxSmall = 0;
+		let maxLarge = 0;
+		let tree: { path: string; sha: string }[] = [];
+		const impl = (async (input: string | URL | Request, init?: RequestInit) => {
+			const path = new URL(String(input)).pathname;
+			const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+			if (path.endsWith("/git/blobs")) {
+				const isLarge = String(body.content).length > 8 * 1024 * 1024;
+				if (isLarge) maxLarge = Math.max(maxLarge, ++largeInFlight);
+				else maxSmall = Math.max(maxSmall, ++inFlight);
+				await new Promise((resolve) => setTimeout(resolve, 5));
+				if (isLarge) largeInFlight--;
+				else inFlight--;
+				const marker = Buffer.from(String(body.content), "base64")[1] ?? 0; // the second byte names the file
+				return new Response(JSON.stringify({ sha: `b${marker}` }));
+			}
+			if (path.endsWith("/git/trees")) {
+				tree = body.tree as { path: string; sha: string }[];
+				return new Response(JSON.stringify({ sha: "t2" }));
+			}
+			return new Response(JSON.stringify({ sha: "c2" }));
+		}) as typeof fetch;
+		const repo = new GitHubRepo({ owner: "me", repo: "sync", token: "t", fetch: impl });
+		await repo.push(
+			"main",
+			parent,
+			[
+				{ path: "a.pdf", content: large(0xf1) },
+				{ path: "b.png", content: small(0xf2) },
+				{ path: "c.pdf", content: large(0xf3) },
+				{ path: "d.png", content: small(0xf4) },
+				{ path: "e.png", content: small(0xf5) },
+			],
+			"m",
+		);
+		assert.equal(maxLarge, 1, "never two large uploads at once");
+		assert.equal(maxSmall, 3, "small uploads still run together");
+		assert.deepEqual(
+			tree.map((e) => [e.path, e.sha]),
+			[["a.pdf", "b241"], ["b.png", "b242"], ["c.pdf", "b243"], ["d.png", "b244"], ["e.png", "b245"]],
+		);
 	});
 
 	it("fails as a conflict, never forcing, when the branch moved", async () => {

@@ -168,7 +168,13 @@ async function round(deps: SyncDeps): Promise<SyncReport> {
 	// ── 1. ASYNC: read ──────────────────────────────────────────────────────
 	const head = await remote.head(branch);
 	const remoteShas: Record<string, string> = {};
-	if (head) for (const [p, e] of Object.entries(ownedByApp(await remote.tree(head.tree), deps.scope))) remoteShas[p] = e.sha;
+	const remoteSizes: Record<string, number> = {}; // blob SHA → bytes, so a large download gets a long enough timeout
+	if (head) {
+		for (const [p, e] of Object.entries(ownedByApp(await remote.tree(head.tree), deps.scope))) {
+			remoteShas[p] = e.sha;
+			remoteSizes[e.sha] = e.size;
+		}
+	}
 	const manifest = readManifest(syncDir, repoName, branch);
 	const base = manifest.files;
 	const localShas = scanLocal(dataDir, deps.scope);
@@ -181,7 +187,7 @@ async function round(deps: SyncDeps): Promise<SyncReport> {
 	}
 
 	const wantRemote = plan.filter((a) => ["pull", "merge"].includes(a.kind) || (a.kind === "conflict-delete" && a.deleted === "local")).map((a) => remoteShas[a.path]);
-	const remoteBytes = await remote.blobs(wantRemote.filter((s): s is string => !!s));
+	const remoteBytes = await remote.blobs(wantRemote.filter((s): s is string => !!s), remoteSizes);
 	const baseBlobs = await fetchOptional(
 		remote,
 		plan.filter((a) => a.kind === "merge").map((a) => base[a.path]).filter((s): s is string => !!s),
@@ -374,7 +380,13 @@ export async function runReplace(deps: SyncDeps, opts: { dryRun?: boolean } = {}
 	// ── ASYNC: read ─────────────────────────────────────────────────────────
 	const head = await remote.head(branch);
 	const remoteShas: Record<string, string> = {};
-	if (head) for (const [p, e] of Object.entries(ownedByApp(await remote.tree(head.tree), deps.scope))) remoteShas[p] = e.sha;
+	const remoteSizes: Record<string, number> = {}; // blob SHA → bytes, for the download timeouts
+	if (head) {
+		for (const [p, e] of Object.entries(ownedByApp(await remote.tree(head.tree), deps.scope))) {
+			remoteShas[p] = e.sha;
+			remoteSizes[e.sha] = e.size;
+		}
+	}
 	report.commit = head?.commit ?? null;
 	if (!head || Object.keys(remoteShas).length === 0) {
 		throw new ReplaceRefused("The repo holds no synced data, so there is nothing to replace this device with.");
@@ -385,7 +397,7 @@ export async function runReplace(deps: SyncDeps, opts: { dryRun?: boolean } = {}
 	const removePaths = Object.keys(localShas).filter((p) => !(p in remoteShas) && p !== "settings.json");
 	report.counts = { write: tally(writePaths), remove: tally(removePaths) };
 	if (opts.dryRun) return report;
-	const blobs = await remote.blobs(writePaths.map((p) => remoteShas[p] as string));
+	const blobs = await remote.blobs(writePaths.map((p) => remoteShas[p] as string), remoteSizes);
 
 	// ── SYNC: back up, then apply ───────────────────────────────────────────
 	const stamp = now().toISOString().replace(/[:.]/g, "-");
